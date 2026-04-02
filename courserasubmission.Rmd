@@ -1,0 +1,97 @@
+---
+title: "Personal Activity Monitoring Analysis"
+author: "Om Dave"
+output: html_document
+---
+
+```{r setup, echo=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+# Load dataset
+setwd("C:/Users/Om Dave/Downloads/repdata_data_activity")
+data <- read.csv("activity.csv")
+
+# Convert date column
+data$date <- as.Date(data$date)
+# Total steps per day (ignoring NA)
+steps_per_day <- aggregate(steps ~ date, data = data, sum, na.rm = TRUE)
+
+# Histogram
+hist(steps_per_day$steps,
+     main = "Histogram of Total Steps Per Day",
+     xlab = "Total Steps Per Day",
+     col = "lightblue",
+     border = "black")
+
+# Mean and Median
+mean_steps <- mean(steps_per_day$steps)
+median_steps <- median(steps_per_day$steps)
+
+cat("Mean steps per day:", mean_steps, "\n")
+cat("Median steps per day:", median_steps, "\n")
+# Average steps per interval
+avg_steps_interval <- aggregate(steps ~ interval, data = data, mean, na.rm = TRUE)
+
+# Time series plot
+plot(avg_steps_interval$interval, avg_steps_interval$steps,
+     type = "l",
+     xlab = "5-minute Interval",
+     ylab = "Average Steps",
+     main = "Average Daily Activity Pattern")
+
+# Interval with maximum steps
+max_interval <- avg_steps_interval[which.max(avg_steps_interval$steps), ]
+
+cat("Interval with maximum average steps:\n")
+print(max_interval)
+# Count missing values
+total_NA <- sum(is.na(data$steps))
+cat("Total missing values:", total_NA, "\n")
+# Copy dataset
+data_imputed <- data
+
+# Compute interval means
+interval_means <- aggregate(steps ~ interval, data = data, mean, na.rm = TRUE)
+
+# Replace NA values
+for(i in 1:nrow(data_imputed)) {
+  if(is.na(data_imputed$steps[i])) {
+    interval <- data_imputed$interval[i]
+    data_imputed$steps[i] <- interval_means$steps[interval_means$interval == interval]
+  }
+}
+# Total steps per day (imputed)
+steps_per_day_imputed <- aggregate(steps ~ date, data = data_imputed, sum)
+
+# Histogram
+hist(steps_per_day_imputed$steps,
+     main = "Histogram of Total Steps Per Day (After Imputation)",
+     xlab = "Total Steps Per Day",
+     col = "lightgreen",
+     border = "black")
+
+# Mean and Median
+mean_imputed <- mean(steps_per_day_imputed$steps)
+median_imputed <- median(steps_per_day_imputed$steps)
+
+cat("Mean after imputation:", mean_imputed, "\n")
+cat("Median after imputation:", median_imputed, "\n")
+# Create weekday/weekend variable
+data_imputed$day_type <- ifelse(weekdays(data_imputed$date) %in% c("Saturday", "Sunday"),
+                               "weekend", "weekday")
+
+data_imputed$day_type <- as.factor(data_imputed$day_type)
+
+# Average steps by interval and day type
+avg_steps_daytype <- aggregate(steps ~ interval + day_type, data = data_imputed, mean)
+
+# Load lattice for panel plot
+library(lattice)
+
+# Panel plot
+xyplot(steps ~ interval | day_type,
+       data = avg_steps_daytype,
+       type = "l",
+       layout = c(1,2),
+       xlab = "5-minute Interval",
+       ylab = "Average Steps",
+       main = "Weekday vs Weekend Activity Patterns")
