@@ -1,0 +1,252 @@
+---
+title: "Predicting Weight-Lifting Exercise Quality from Wearable Accelerometer Data"
+author: "Practical Machine Learning - Course Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+set.seed(2026)
+```
+
+## 1. Summary
+
+Six participants performed barbell lifts correctly (class **A**) and incorrectly in four
+specific ways (classes **B-E**) while wearing accelerometers on the belt, forearm, arm and
+dumbbell (Velloso et al., 2013). The task is to predict the `classe` label from the sensor
+readings.
+
+My approach in brief:
+
+1. Remove identifier, timestamp and mostly-empty columns, leaving only sensor measurements.
+2. Hold out 30% of the labelled data as a **validation set** that is never used for training or tuning.
+3. Train a **random forest** using **5-fold cross-validation** on the remaining 70%.
+4. Estimate the out-of-sample error from both the CV result and the untouched validation set.
+5. Predict the 20 quiz test cases with the final model.
+
+```{r libs}
+library(caret)
+library(randomForest)
+library(ggplot2)
+```
+
+## 2. Data
+
+```{r data}
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+# Cache local copies so the report can be re-knitted offline
+if (!file.exists("pml-training.csv")) download.file(train_url, "pml-training.csv", mode = "wb")
+if (!file.exists("pml-testing.csv"))  download.file(test_url,  "pml-testing.csv",  mode = "wb")
+
+na_codes <- c("NA", "", "#DIV/0!")
+training <- read.csv("pml-training.csv", na.strings = na_codes)
+testing  <- read.csv("pml-testing.csv",  na.strings = na_codes)
+
+dim(training)
+dim(testing)
+```
+
+## 3. Cleaning and feature selection
+
+The raw file contains many summary-statistic columns (e.g. `kurtosis_*`, `skewness_*`,
+`max_*`, `min_*`, `avg_*`, `var_*`, `stddev_*`) that are only filled on the rows where a
+new time window begins. They are almost entirely `NA`, and they are also empty in the 20
+test cases, so they cannot help prediction there.
+
+I made three choices:
+
+* **Drop columns that are >90% `NA`.** They carry almost no information and cannot be used on the test cases.
+* **Drop row index, user name, timestamps and window markers** (`X`, `user_name`,
+  `raw_timestamp_part_1/2`, `cvtd_timestamp`, `new_window`, `num_window`). The training
+  data are ordered by class and time, so these columns would let a model "predict" `classe` by
+  position or time rather than by movement. That would give a deceptively good CV score and
+  would not reflect real generalisation.
+* **Drop near-zero-variance predictors.**
+
+```{r clean}
+na_frac  <- colMeans(is.na(training))
+keep     <- names(na_frac)[na_frac <= 0.90]
+
+id_cols  <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2",
+              "cvtd_timestamp", "new_window", "num_window")
+keep     <- setdiff(keep, id_cols)
+
+training <- training[, keep]
+training$classe <- factor(training$classe)
+
+nzv      <- nearZeroVar(training[, setdiff(names(training), "classe")])
+if (length(nzv) > 0) training <- training[, -nzv]
+
+predictors <- setdiff(names(training), "classe")
+cat("Predictors retained:", length(predictors), "\n")
+cat("Any NA remaining in training:", anyNA(training), "\n")
+```
+
+The test set is reduced to exactly the same predictor columns (it has no `classe`).
+
+```{r clean-test}
+testing_clean <- testing[, predictors]
+cat("Any NA remaining in test set:", anyNA(testing_clean), "\n")
+```
+
+### Class balance
+
+```{r fig-classes, fig.width=6, fig.height=3.5}
+ggplot(training, aes(classe, fill = classe)) +
+  geom_bar(show.legend = FALSE) +
+  labs(title = "Training observations per class", x = "classe", y = "Count") +
+  theme_minimal()
+```
+
+Class A (correct execution) is the most common, but the five classes are reasonably
+balanced, so plain accuracy is a sensible metric and no resampling for imbalance is needed.
+
+## 4. Model building
+
+### Validation split
+
+I split the labelled data 70/30, stratified on `classe`. The 30% validation set is used
+**once**, after the model is final, to get an unbiased out-of-sample estimate.
+
+```{r split}
+in_train <- createDataPartition(training$classe, p = 0.70, list = FALSE)
+build    <- training[in_train, ]
+valid    <- training[-in_train, ]
+c(build = nrow(build), validation = nrow(valid))
+```
+
+### Cross-validation and model choice
+
+I used **5-fold cross-validation** inside `caret::train()` on the build set. Five folds
+balance bias and variance of the error estimate against run time (10 folds is slightly less biased
+but about twice as slow on a dataset of this size).
+
+I chose a **random forest** because:
+
+* the predictors are numerous, correlated and on different scales, and random forests need no scaling;
+* the relationship between sensor readings and movement error is strongly non-linear, with interactions between sensors;
+* forests are robust to noisy features and give built-in variable importance;
+* in the original study (Velloso et al.) random forests also performed very well on this data.
+
+```{r train, cache=TRUE}
+ctrl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+
+rf_fit <- train(classe ~ ., data = build,
+                method    = "rf",
+                trControl = ctrl,
+                tuneLength = 3,
+                ntree     = 200)
+
+rf_fit
+```
+
+`caret` tuned `mtry` (the number of variables tried at each split) by cross-validated
+accuracy and refit on the full build set with the best value.
+
+```{r cv-error}
+cv_acc <- max(rf_fit$results$Accuracy)
+cat(sprintf("Cross-validated accuracy: %.4f  ->  CV error estimate: %.4f\n",
+            cv_acc, 1 - cv_acc))
+```
+
+## 5. Out-of-sample error
+
+The cross-validation figure above is already an out-of-sample estimate, since each fold is
+predicted by a model that did not see it. It is slightly optimistic, though, because the same
+folds were used to choose `mtry`. The held-out validation set has not influenced any
+modelling decision and gives the cleaner check.
+
+```{r validate}
+pred_valid <- predict(rf_fit, newdata = valid)
+cm <- confusionMatrix(pred_valid, valid$classe)
+cm$overall[c("Accuracy", "AccuracyLower", "AccuracyUpper")]
+
+oos_error <- 1 - unname(cm$overall["Accuracy"])
+cat(sprintf("Validation-set error (expected out-of-sample error): %.4f (%.2f%%)\n",
+            oos_error, 100 * oos_error))
+```
+
+```{r fig-cm, fig.width=6, fig.height=4.5}
+cm_df <- as.data.frame(cm$table)
+ggplot(cm_df, aes(Reference, Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Validation-set confusion matrix") +
+  theme_minimal()
+```
+
+**Expected out-of-sample error.** I take the validation-set error as my best estimate of
+the error on new data, and I expect the CV estimate to be close to it. Both are computed in
+the chunks above, so the exact figures appear in the knitted output rather than being
+hard-coded here.
+
+Two caveats matter for how far to trust this number:
+
+* The 6 participants appear in both the build and validation sets, because the split is random over rows. The estimate therefore measures
+  generalisation to **new repetitions by known people**. Accuracy on a completely new
+  person would probably be lower. A leave-one-participant-out scheme would measure that,
+  but the 20 quiz cases come from the same six people, so row-wise CV matches the actual
+  prediction task.
+* The validation set is finite, so the estimate has sampling noise. The 95% interval
+  printed above (`AccuracyLower`, `AccuracyUpper`) shows its size.
+
+## 6. Which sensors matter?
+
+```{r fig-imp, fig.width=6.5, fig.height=5}
+imp <- varImp(rf_fit)$importance
+imp$variable <- rownames(imp)
+imp <- head(imp[order(-imp$Overall), ], 15)
+
+ggplot(imp, aes(reorder(variable, Overall), Overall)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 variables by importance", x = NULL, y = "Importance (scaled)") +
+  theme_minimal()
+```
+
+## 7. Final model and the 20 test cases
+
+Having confirmed the approach on held-out data, I refit the same configuration on **all**
+labelled rows (build + validation) so the final model uses every available observation, then
+predict the 20 test cases.
+
+```{r final}
+final_fit <- train(classe ~ ., data = training,
+                   method     = "rf",
+                   trControl  = trainControl(method = "none"),
+                   tuneGrid   = data.frame(mtry = rf_fit$bestTune$mtry),
+                   ntree      = 200)
+
+test_pred <- predict(final_fit, newdata = testing_clean)
+data.frame(problem_id = testing$problem_id, prediction = test_pred)
+```
+
+```{r write-answers}
+# One file per problem, in the format used by the course submission page
+dir.create("answers", showWarnings = FALSE)
+for (i in seq_along(test_pred)) {
+  writeLines(as.character(test_pred[i]),
+             file.path("answers", paste0("problem_id_", i, ".txt")))
+}
+```
+
+## 8. Conclusions
+
+* Removing identifier and time columns is essential, because otherwise the model can cheat by position.
+* A random forest with 5-fold CV on about 50 sensor predictors separates the five execution styles very accurately.
+* The validation-set error reported in Section 5 is my expected out-of-sample error, with the participant caveat noted there.
+
+## Citation
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. *Qualitative Activity
+Recognition of Weight Lifting Exercises.* Proceedings of the 4th International Conference
+in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.
+Data and description: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
